@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ViT attention viewer</title>
+<!-- Filled by qwen_eye.viewer: the payload replaces the marker below.
+     A and B are x average (1 = the patch gets 1/n of the attention); E (gradient pages only:
+     HiResCAM, Grad-CAM, D, C, W) is in each map's own units; see docs/methods.md. -->
+<style>
+  :root { --bg: #f7f7f5; --panel: #ffffff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e2e2dd; --accent: #16a34a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121212; --panel: #1c1c1c; --fg: #e6e6e3; --muted: #9a9a94; --line: #2e2e2c; --accent: #4ade80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, -apple-system, sans-serif; }
+  header { padding: 12px 16px 4px; }
+  h1 { font-size: 16px; margin: 0 0 2px; font-weight: 600; }
+  .muted { color: var(--muted); }
+  main { display: flex; flex-wrap: wrap; gap: 16px; padding: 8px 16px; align-items: flex-start; }
+  #stage { flex: 0 1 auto; max-width: 100%; }
+  #view { display: block; max-width: 100%; cursor: crosshair; border-radius: 4px; }
+  .transport { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+  .transport input[type=range] { flex: 1; }
+  button { font: inherit; padding: 3px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; width: 360px; max-width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row[hidden] { display: none; }
+  .row > span:first-child { width: 64px; color: var(--muted); }
+  .row select, .row input[type=range] { flex: 1; min-width: 0; }
+  #bar { width: 100%; height: 10px; border-radius: 2px; display: block; }
+  .barlbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  #info { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+  #stripwrap { padding: 4px 16px 20px; }
+  #strip { display: flex; flex-wrap: wrap; gap: 6px; }
+  #strip figure { margin: 0; cursor: pointer; text-align: center; }
+  #strip canvas { display: block; border: 2px solid transparent; border-radius: 3px; }
+  #strip figure.sel canvas { border-color: var(--accent); }
+  #strip figcaption { font-size: 11px; color: var(--muted); }
+  #question { margin-top: 6px; max-width: 900px; white-space: pre-wrap; }
+  #question b { font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="muted" id="subtitle"></div>
+  <div id="question" hidden></div>
+</header>
+<main>
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <div class="transport">
+      <button id="play" title="space">&#9654; play</button>
+      <button id="prev" title="left arrow">&#9664;</button>
+      <button id="next" title="right arrow">&#9654;</button>
+      <input type="range" id="frame" min="0" value="0" aria-label="frame">
+    </div>
+  </div>
+  <div class="panel">
+    <div class="row"><span>Map</span>
+      <select id="map">
+        <option value="A">A: attention received (all queries)</option>
+        <option value="B">B: where the clicked 2&times;2 block looks</option>
+      </select></div>
+    <div class="row" id="scorerow" hidden><span>Score</span><select id="emap"></select></div>
+    <div class="row" id="methodrow" hidden><span>Method</span><select id="emethod"></select></div>
+    <div class="row"><span>Layer</span><select id="layer"></select></div>
+    <div class="row"><span>Head</span><select id="head"></select></div>
+    <div class="row"><span>Opacity</span><input type="range" id="alpha" min="0" max="1" step="0.05" value="0.6"></div>
+    <div class="row"><span>Colour</span>
+      <select id="scale">
+        <option value="clip">fixed per layer (clip 99th pct)</option>
+        <option value="frame">per frame (99th pct)</option>
+        <option value="max">per frame (max)</option>
+      </select></div>
+    <div class="row"><span></span><label><input type="checkbox" id="smooth" checked> smooth</label>
+      <label><input type="checkbox" id="blocks"> 2&times;2 token grid</label></div>
+    <div><canvas id="bar" width="256" height="1"></canvas>
+      <div class="barlbl"><span>0</span><span id="vmax"></span></div></div>
+    <div id="info"></div>
+    <div class="muted" id="hint">Click the frame to see where that 2&times;2 block (one LLM token) looks.
+      Keys: &larr; &rarr; step, space play/pause.</div>
+  </div>
+</main>
+<div id="stripwrap">
+  <div class="muted" id="striptitle"></div>
+  <div id="strip"></div>
+</div>
+<script>
+"use strict";
+const P = /*__PAYLOAD__*/null;
+const M = P.meta, S = P.stats;
+const [T, GH, GW] = M.grid;
+const N = GH * GW, MG = M.merge, BW = GW / MG, NB = (GH / MG) * BW;
+const PX = M.patch, W = GW * PX, H = GH * PX, NF = P.frames.length;
+const LB = M.layers_B, LA = P.A.shape[0], HA = P.A.shape[2];
+const E = P.E || null, G = P.G || null;
+
+function bytes(b64) {
+  const s = atob(b64), u = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+  return u;
+}
+function decoder(xmax) {        // inverse of quant.encode
+  const k = Math.log1p(xmax) / 255, d = new Float32Array(256);
+  for (let q = 0; q < 256; q++) d[q] = Math.expm1(q * k);
+  return d;
+}
+function linearDecoder(xmax) {  // inverse of quant.encode(log=False)
+  const d = new Float32Array(256);
+  for (let q = 0; q < 256; q++) d[q] = q * Math.max(xmax, 1e-30) / 255;
+  return d;
+}
+const QA = bytes(P.A.b64), QB = P.B ? bytes(P.B.b64) : null;   // B is left out of very large clips
+const DA = P.A.xmax.map(decoder), DB = P.B ? P.B.xmax.map(decoder) : null;
+const QE = E ? E.methods.map(m => bytes(m.b64)) : null;                 // per map: [sides, parts, pairs, N]
+const DE = E ? E.methods.map(m => m.xmax.map(row => row.map(linearDecoder))) : null;
+const LUT = P.lut;
+const imgs = P.frames.map(src => { const im = new Image(); im.src = src; return im; });
+
+const blockOf = (r, c) => Math.floor(r / MG) * BW + Math.floor(c / MG);
+const pairOf = f => Math.min(Math.floor(f / M.tpatch), T - 1);
+const st = { f: 0, map: "A", layer: LB.includes(8) ? 8 : LB[0], head: 0, emap: 0, method: 0, part: null,
+             block: blockOf(GH >> 1, GW >> 1), alpha: 0.6, scale: "clip",
+             smooth: true, blocks: false, timer: null, hover: null };
+
+const em = () => E.methods[st.method];
+const cur = () => st.map === "E" ? st.part : st.layer;      // E: a part ("8", "all", "r16", ...)
+function partLabel(p) {
+  return { all: "all routes", norm: "all routes, rows normalised" }[p] ??
+    (p.startsWith("r") ? `route after block ${p.slice(1)}` : `layer ${p}`);
+}
+function defaultPart() {
+  const ps = em().parts;
+  if (ps.includes(String(st.layer))) return String(st.layer);
+  if (ps.includes("all")) return "all";
+  return ps.reduce((a, b) => Math.abs(+b - st.layer) < Math.abs(+a - st.layer) ? b : a);
+}
+
+function values(map, layer, pair) {   // grid order, x average (E: the map's units); layer: E's part
+  const out = new Float32Array(N);
+  if (map === "E") {
+    const me = em(), pi = me.parts.indexOf(layer), d = DE[st.method][st.emap][pi];
+    const o = ((st.emap * me.parts.length + pi) * T + pair) * N, q = QE[st.method];
+    for (let i = 0; i < N; i++) out[i] = d[q[o + i]];
+  } else if (map === "A") {
+    const d = DA[layer], o = ((layer * T + pair) * HA + st.head) * N;
+    for (let i = 0; i < N; i++) out[i] = d[QA[o + i]];
+  } else {
+    const li = LB.indexOf(layer), d = DB[li], o = ((li * T + pair) * NB + st.block) * N;
+    for (let i = 0; i < N; i++) out[i] = d[QB[o + i]];
+  }
+  return out;
+}
+function vmaxOf(vals, map, layer) {
+  if (st.scale === "clip") return map === "E" ? em().p99[st.emap][em().parts.indexOf(layer)]
+    : map === "A" ? P.A.p99[layer][st.head] : P.B.p99[LB.indexOf(layer)];
+  const s = Float32Array.from(vals).sort();
+  return st.scale === "max" ? s[N - 1] : s[Math.floor(0.99 * (N - 1))];
+}
+
+const heat = document.createElement("canvas");
+heat.width = GW; heat.height = GH;
+const hctx = heat.getContext("2d");
+function paint(ctx, w, h, f, map, layer) {
+  const vals = values(map, layer, pairOf(f));
+  const vmax = Math.max(vmaxOf(vals, map, layer), 1e-6);
+  const im = hctx.createImageData(GW, GH);
+  for (let i = 0; i < N; i++) {
+    const c = LUT[Math.min(255, Math.round(255 * vals[i] / vmax))];
+    im.data[4 * i] = c[0]; im.data[4 * i + 1] = c[1]; im.data[4 * i + 2] = c[2]; im.data[4 * i + 3] = 255;
+  }
+  hctx.putImageData(im, 0, 0);
+  ctx.globalAlpha = 1; ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(imgs[f], 0, 0, w, h);
+  ctx.globalAlpha = st.alpha; ctx.imageSmoothingEnabled = st.smooth;
+  ctx.drawImage(heat, 0, 0, w, h);
+  ctx.globalAlpha = 1;
+  return { vals, vmax };
+}
+
+const view = document.getElementById("view"), vctx = view.getContext("2d");
+view.width = W; view.height = H;
+view.style.width = Math.round(Math.min(W * 1.5, 960)) + "px";   // HD clips: keep the panel beside it
+const $ = id => document.getElementById(id);
+
+function layersOfMap() { return st.map === "A" ? [...Array(LA).keys()] : st.map === "E" ? em().parts : LB; }
+const unit = () => st.map === "E" ? ` (${em().unit})` : "× average";
+function fillLayerSelect() {
+  $("layer").innerHTML = layersOfMap().map(L =>
+    `<option value="${L}">${st.map === "E" && isNaN(+L) ? partLabel(L) : L}</option>`).join("");
+  $("layer").value = cur();
+  $("head").disabled = st.map !== "A";
+  $("scorerow").hidden = $("methodrow").hidden = st.map !== "E";
+}
+function buildStrip() {
+  const strip = $("strip");
+  strip.innerHTML = "";
+  for (const L of layersOfMap()) {
+    const fig = document.createElement("figure"), c = document.createElement("canvas");
+    c.width = GW * 4; c.height = GH * 4; fig.dataset.layer = L;
+    const cap = document.createElement("figcaption");
+    cap.textContent = isNaN(+L) ? partLabel(L) : `L${L} · ${S.layers[+L].mean_dist.toFixed(1)}p`;
+    fig.append(c, cap);
+    fig.onclick = () => select(L);
+    strip.append(fig);
+  }
+  $("striptitle").textContent = `All ${st.map === "A" ? "layers" : st.map === "E" ? "parts of this map"
+    : "layers with B data"} at this frame ` +
+    `(caption: mean attention distance in patches; uniform would be ${S.uniform_mean_dist.toFixed(1)}). Click one to select it.`;
+}
+function drawStrip() {
+  for (const fig of $("strip").children) {
+    const L = st.map === "E" ? fig.dataset.layer : +fig.dataset.layer, c = fig.firstChild;
+    paint(c.getContext("2d"), c.width, c.height, st.f, st.map, L);
+    fig.classList.toggle("sel", L === cur());
+  }
+}
+function select(L) {
+  if (st.map === "E") st.part = String(L); else st.layer = +L;
+  $("layer").value = cur(); draw();
+}
+
+function draw() {
+  const pair = pairOf(st.f);
+  const { vals, vmax } = paint(vctx, W, H, st.f, st.map, cur());
+  if (st.blocks) {
+    vctx.strokeStyle = "rgba(255,255,255,0.25)"; vctx.lineWidth = 1; vctx.beginPath();
+    for (let c = MG; c < GW; c += MG) { vctx.moveTo(c * PX + 0.5, 0); vctx.lineTo(c * PX + 0.5, H); }
+    for (let r = MG; r < GH; r += MG) { vctx.moveTo(0, r * PX + 0.5); vctx.lineTo(W, r * PX + 0.5); }
+    vctx.stroke();
+  }
+  if (st.map === "B") {
+    const br = Math.floor(st.block / BW) * MG, bc = (st.block % BW) * MG;
+    vctx.strokeStyle = "#4ade80"; vctx.lineWidth = 2;
+    vctx.strokeRect(bc * PX + 1, br * PX + 1, MG * PX - 2, MG * PX - 2);
+  }
+  if (st.hover) {
+    vctx.strokeStyle = "rgba(255,255,255,0.8)"; vctx.lineWidth = 1;
+    vctx.strokeRect(st.hover[1] * PX + 0.5, st.hover[0] * PX + 0.5, PX - 1, PX - 1);
+  }
+  $("vmax").textContent = (st.map === "E" ? vmax.toPrecision(3) : vmax.toFixed(2)) + unit();
+  const L = st.map === "E" ? +st.part : st.layer, s = S.layers[L], lbl = M.pair_labels[pair];
+  let info = `frame ${st.f + 1}/${NF}  t = ${M.frame_times[st.f].toFixed(2)} s\n` +
+             `pair ${pair + 1}/${T}  (LLM label <${lbl ?? "?"} seconds>)` +
+             (M.padded[st.f] ? "\n(padded: repeat of the last frame)" : "") +
+             (Number.isInteger(L) && s ? `\nlayer ${L}: mean attention distance ${s.mean_dist.toFixed(1)} patches ` +
+             `(uniform ${S.uniform_mean_dist.toFixed(1)}); top 1% of patches get ` +
+             `${(100 * s.top1_share).toFixed(1)}% of A (uniform ${(100 * S.uniform_top1_share).toFixed(1)}%)`
+             : st.map === "E" ? `\n${partLabel(st.part)}` : "");
+  if (st.map === "E") info += "\n\n" + scoreInfo();
+  if (st.hover) {
+    const [r, c] = st.hover, v = vals[r * GW + c];
+    info += `\nhover: patch row ${r}, col ${c} = ${st.map === "E" ? v.toPrecision(3) : v.toFixed(2)}${unit()}`;
+  }
+  $("info").textContent = info;
+  $("frame").value = st.f;
+  drawStrip();
+}
+
+function scoreInfo() {
+  const rec = G.scores[E.group[st.emap]], r = rec.report;
+  const ps = r.p ? Object.entries(r.p).map(([k, v]) => `p(${k}) ${v.toFixed(3)}`).join(", ") : "";
+  let s = `${em().name}: ${E.labels[st.emap]}\nscore ${rec.name} = ${rec.value.toFixed(3)} ` +
+          `(plain eval forward ${rec.plain_value.toFixed(3)})`;
+  if (rec.name === "answer") s += `\n  = logit(${G.item.correct}) - logit(${r.wrong ?? G.item.wrong}); ` +
+    `${ps}; first token "${r.argmax_token}"`;
+  else if (r.question) s += `\n  = logit(Yes) - logit(No) after "${r.question}"\n  ${ps}; first token "${r.argmax_token}"`;
+  else s += `\n  = log p("${rec.name.slice(8)}" | video, "${r.prompt}")`;
+  if (E.labels.filter((_, i) => E.group[i] === E.group[st.emap]).length > 1)
+    s += "\n  colour scale shared with the other side of this score";
+  const mix = rec.relevance && rec.relevance.mixing_share;
+  if (mix && ["D", "W"].includes(em().key))
+    s += `\n  share of D + W carried by attention (D): for ${mix[0].toFixed(2)}, against ${mix[1].toFixed(2)}`;
+  return s;
+}
+function setMap(map) {
+  st.map = map; $("map").value = map;
+  const near = Ls => Ls.reduce((a, b) => Math.abs(b - st.layer) < Math.abs(a - st.layer) ? b : a);
+  if (map === "B" && !LB.includes(st.layer)) st.layer = near(LB);
+  if (map === "E" && !(st.part && em().parts.includes(st.part))) st.part = defaultPart();
+  fillLayerSelect(); buildStrip(); draw();
+}
+function step(d) { st.f = (st.f + d + NF) % NF; draw(); }
+function togglePlay() {
+  if (st.timer) { clearInterval(st.timer); st.timer = null; $("play").innerHTML = "&#9654; play"; }
+  else { st.timer = setInterval(() => step(1), 1000 / M.fps); $("play").innerHTML = "&#10074;&#10074; pause"; }
+}
+function cellAt(e) {
+  const r = view.getBoundingClientRect();
+  const col = Math.floor((e.clientX - r.left) / r.width * GW), row = Math.floor((e.clientY - r.top) / r.height * GH);
+  return (row >= 0 && row < GH && col >= 0 && col < GW) ? [row, col] : null;
+}
+
+$("title").textContent = (G && G.item ? G.item.key + " · " : G ? "phrases · " : "") + M.video.split("/").pop();
+if (E) {
+  $("map").insertAdjacentHTML("beforeend", '<option value="E">E: gradient map (what mattered)</option>');
+  $("emap").innerHTML = E.labels.map((l, i) => `<option value="${i}">${l}</option>`).join("");
+  $("emethod").innerHTML = E.methods.map((m, i) => `<option value="${i}">${m.key}: ${m.name}</option>`).join("");
+  if (G.item) {
+    const it = G.item, ans = it.eval_answer.trim();
+    const el = it.eval_letter ?? (ans === "A" || ans === "B" ? ans : "");
+    const aw = (G.scores.find(r => r.name === "answer") || { report: {} }).report.wrong;
+    const mark = k => (k === it.correct ? " ← correct" : "") + (k === el ? " ← model answered" : "") +
+      (k === aw && k !== el ? " ← contrasted" + (it.wrong == null ? " (strongest other option)" : "") : "");
+    $("question").innerHTML = "";
+    $("question").append(Object.assign(document.createElement("b"), { textContent: "Question: " }),
+      it.prompt.split("\n")[0] + "\n" + Object.keys(it.options).map(k => `(${k}) ${it.options[k]}${mark(k)}`).join("\n") +
+      (el && ans.replace(/[.):\s]/g, "") === el ? "" : `\nmodel replied: "${ans}"`));
+    $("question").hidden = false;
+  }
+}
+$("subtitle").textContent =
+  `${M.model.split("/").slice(-3).join("/")} · ${NF} frames at ${M.fps} fps = what the model gets · ` +
+  `${T} pairs of ${GH}×${GW} patches (${W}×${H} px) · ${M.dtype} on ${M.device} · checks: ` +
+  Object.entries(M.checks).map(([k, v]) => `${k} ${v.toExponential(1)}`).join(", ");
+if (!P.B) {
+  $("map").querySelector('option[value="B"]').remove();
+  $("hint").textContent = "Map B is not in this page (too large at this resolution). Keys: ← → step, space play/pause.";
+  $("subtitle").textContent += "  ·  map B not embedded (too large at this resolution; it is in maps.npz)";
+}
+if (G && G.checks_failed.length) $("subtitle").textContent += "  ·  GRADIENT-MAP CHECKS FAILED: " + G.checks_failed.join("; ");
+if (E && E.dropped.length) $("subtitle").textContent += "  ·  not embedded (page size): " + E.dropped.join(", ");
+$("frame").max = NF - 1;
+$("head").innerHTML = `<option value="0">average of ${HA - 1} heads</option>` +
+  [...Array(HA - 1).keys()].map(h => `<option value="${h + 1}">head ${h}</option>`).join("");
+const bar = $("bar").getContext("2d"), bim = bar.createImageData(256, 1);
+LUT.forEach((c, i) => { bim.data.set([c[0], c[1], c[2], 255], 4 * i); });
+bar.putImageData(bim, 0, 0);
+
+$("map").onchange = e => setMap(e.target.value);
+$("emap").onchange = e => { st.emap = +e.target.value; draw(); };
+$("emethod").onchange = e => {
+  st.method = +e.target.value;
+  if (!em().parts.includes(st.part)) st.part = defaultPart();
+  fillLayerSelect(); buildStrip(); draw();
+};
+$("layer").onchange = e => select(e.target.value);
+$("head").onchange = e => { st.head = +e.target.value; draw(); };
+$("alpha").oninput = e => { st.alpha = +e.target.value; draw(); };
+$("scale").onchange = e => { st.scale = e.target.value; draw(); };
+$("smooth").onchange = e => { st.smooth = e.target.checked; draw(); };
+$("blocks").onchange = e => { st.blocks = e.target.checked; draw(); };
+$("frame").oninput = e => { st.f = +e.target.value; draw(); };
+$("play").onclick = togglePlay;
+$("prev").onclick = () => step(-1);
+$("next").onclick = () => step(1);
+view.onmousemove = e => { st.hover = cellAt(e); draw(); };
+view.onmouseleave = () => { st.hover = null; draw(); };
+view.onclick = e => {
+  const cell = cellAt(e);
+  if (!cell) return;
+  if (!P.B) return;
+  st.block = blockOf(cell[0], cell[1]);
+  if (st.map !== "B") setMap("B"); else draw();
+};
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+  if (e.key === "ArrowLeft") step(-1);
+  else if (e.key === "ArrowRight") step(1);
+  else if (e.key === " ") { e.preventDefault(); togglePlay(); }
+});
+
+Promise.all(imgs.map(im => im.decode())).then(() => setMap(E ? "E" : "A"));
+</script>
+</body>
+</html>

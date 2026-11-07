@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-eye"
+version = "0.1.0"
+description = "Where Qwen3-VL's vision tower looks in a video: ViT attention, Grad-CAM/HiResCAM, Chefer relevance and deletion tests, drawn over the frames the model sees."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rizeen Musaliyarakath" }]
+requires-python = ">=3.10"
+keywords = ["qwen3-vl", "vision-language", "interpretability", "attention", "grad-cam", "video"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "torch>=2.4",
+    "torchvision",
+    # the capture and the taps hook into Qwen3-VL's modules as written in this release
+    "transformers==4.57.6",
+    "accelerate",
+    "safetensors",
+    "huggingface_hub",
+    "qwen-vl-utils>=0.0.14",
+    # qwen-vl-utils reads videos with torchcodec, else decord, else torchvision; lmms-eval runs use decord
+    "decord; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "av",
+    "numpy",
+    "pillow",
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "scipy"]
+# only for tests/test_tower.py, which checks the preprocessing against lmms-eval's own
+lmms = ["lmms-eval==0.7.2"]
+
+[project.scripts]
+qwen-eye = "qwen_eye.cli:main"
+
+[project.urls]
+Repository = "https://github.com/rizeenmusadhik/Qwen-eye"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+qwen_eye = ["viewer_template.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
